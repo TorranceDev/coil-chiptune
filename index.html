@@ -66,6 +66,10 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   .seg button { min-height: 40px; border-radius: 10px; border: 1.5px solid var(--line); background: transparent;
                 color: var(--ink); font: inherit; font-size: .9rem; cursor: pointer; }
   .seg button.on { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .tests { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
+  .tests button { min-height: 44px; border-radius: 10px; border: 1.5px solid var(--accent); background: transparent;
+                  color: var(--accent); font: inherit; font-size: .9rem; font-weight: 600; cursor: pointer; }
+  .tests button.on { background: var(--accent); color: var(--accent-ink); }
   .hint { font-size: .85rem; color: var(--muted); margin: 0 0 6px; min-height: 1.3em; }
   .gap { height: 10px; }
   details { margin-top: 10px; font-size: .9rem; }
@@ -153,6 +157,19 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
         turn the phone volume down a few steps.</li>
       <li>Keep this page open while it plays.</li>
     </ol>
+    <details id="coilTest">
+      <summary>Coil sound test (1 minute)</summary>
+      <p>Play each clip through the coil. They all play the start of "Ode to Joy" (Beethoven, public domain),
+        each encoded a different way. This shows which method your coil can actually play.</p>
+      <div class="tests">
+        <button type="button" data-test="square">1 · Plain square</button>
+        <button type="button" data-test="narrow">2 · Narrow pulses</button>
+        <button type="button" data-test="pwm">3 · Carrier (PWM)</button>
+        <button type="button" data-test="pdm">4 · Pulse density</button>
+      </div>
+      <audio id="testPlayer" controls playsinline></audio>
+      <p class="hint">Tell Claude: which numbers sound like the tune, and whether 1 and 2 sound the same or different.</p>
+    </details>
   </section>
   <p class="note">Your song never leaves this phone. Busy parts of a song may come out rough. Music with a clear melody on top (a voice, violins, flute) works best. Follow the coil's safety warnings.</p>
 </main>
@@ -600,6 +617,50 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     }
     e.target.value = "";
   });
+
+  // ---------- coil sound test: one public-domain phrase, four encodings
+  const ODE = [[64, 1], [64, 1], [65, 1], [67, 1], [67, 1], [65, 1], [64, 1], [62, 1],
+               [60, 1], [60, 1], [62, 1], [64, 1], [64, 1.5], [62, 0.5], [62, 2]];
+  function odeNotes(beat = 0.35) {
+    const out = []; let t = 0.3;
+    for (const [m, b] of ODE) { out.push({ t0: t, t1: t + b * beat - 0.03, m }); t += b * beat; }
+    return { notes: out, dur: t + 0.3 };
+  }
+  function testSignal(kind) {
+    const { notes, dur } = odeNotes(), len = Math.ceil(dur * SR_OUT), y = new Int16Array(len), A = Math.round(AMP * 32767);
+    const noteAt = t => notes.find(q => t >= q.t0 && t < q.t1);
+    if (kind === "square" || kind === "narrow") {             // same pitch, only the pulse width differs
+      const duty = kind === "square" ? 0.5 : 0.1;
+      for (const q of notes) {
+        const f = 440 * Math.pow(2, (q.m - 69) / 12), s0 = Math.round(q.t0 * SR_OUT), s1 = Math.round(q.t1 * SR_OUT);
+        for (let s = s0; s < s1; s++) y[s] = ((f * (s - s0) / SR_OUT) % 1) < duty ? A : -A;
+      }
+    } else if (kind === "pwm") {                              // tune as a sine + 8 kHz triangle carrier
+      for (let s = 0; s < len; s++) {
+        const t = s / SR_OUT, q = noteAt(t); if (!q) continue;
+        const f = 440 * Math.pow(2, (q.m - 69) / 12), ph = (t * 8000) % 1;
+        y[s] = Math.round(A / 1.7 * (0.7 * Math.sin(2 * Math.PI * f * (t - q.t0)) + 4 * Math.abs(ph - 0.5) - 1));
+      }
+    } else {                                                  // pulse density: sigma-delta, 8000 slots/s, one short pulse per "1"
+      const slot = SR_OUT / 8000, W = 3; let acc = 0;
+      for (let k = 0; k * slot < len; k++) {
+        const s0 = Math.round(k * slot), t = s0 / SR_OUT, q = noteAt(t); if (!q) { acc = 0; continue; }
+        const f = 440 * Math.pow(2, (q.m - 69) / 12);
+        acc += 0.5 + 0.45 * Math.sin(2 * Math.PI * f * (t - q.t0));
+        const s1 = Math.min(len, Math.round((k + 1) * slot));
+        if (acc >= 1) { acc -= 1; for (let s = s0; s < s1; s++) y[s] = s - s0 < W ? A : -A; }
+        else for (let s = s0; s < s1; s++) y[s] = -A;
+      }
+    }
+    return toWav(y);
+  }
+  let testUrl = null;
+  document.querySelectorAll("#coilTest [data-test]").forEach(b => b.addEventListener("click", () => {
+    document.querySelectorAll("#coilTest [data-test]").forEach(o => o.classList.toggle("on", o === b));
+    if (testUrl) URL.revokeObjectURL(testUrl);
+    testUrl = URL.createObjectURL(testSignal(b.dataset.test));
+    const tp = $("testPlayer"); tp.src = testUrl; tp.play().catch(() => {});
+  }));
 
   $("sens").addEventListener("change", () => frames && build());
   $("sens").addEventListener("input", () => { const s = +$("sens").value; $("sensVal").textContent = s < 0.85 ? "catch more" : s > 1.15 ? "cleaner" : "normal"; });
