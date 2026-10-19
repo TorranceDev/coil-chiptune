@@ -118,10 +118,17 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     </div>
     <label class="ctl">Coil arrangement
       <select id="mode">
-        <option value="full" selected>Melody + bass + beat</option>
+        <option value="classic" selected>Classic</option>
+        <option value="real">Real song (experimental)</option>
+        <option value="full">Melody + bass + beat</option>
         <option value="bass">Melody + bass</option>
         <option value="melody">Melody only</option>
-        <option value="classic">Classic (first version)</option>
+      </select>
+    </label>
+    <label class="ctl hidden" id="carrierRow">Carrier
+      <select id="carrier">
+        <option value="8000" selected>8 kHz (clearest in tests)</option>
+        <option value="11000">11 kHz (less whine)</option>
       </select>
     </label>
     <label class="ctl">Melody pickiness <span id="sensVal">normal</span>
@@ -141,9 +148,9 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     <ol>
       <li>Turn on the coil and switch it to music mode.</li>
       <li>Phone Settings → Bluetooth → pick the coil (often named "Tesla coil 10").</li>
-      <li>Start with the coil's power knob low. Turn the phone volume all the way up: the coil version is a
-        full-strength signal, so a strong phone signal lets the coil sound good at a lower power setting.</li>
-      <li>Press play, then raise the coil's knob only as far as you need.</li>
+      <li>Set the coil's knob where it normally sounds good for you.</li>
+      <li>Start the phone volume around the middle, press play, then raise it slowly. If you hear static,
+        turn the phone volume down a few steps.</li>
       <li>Keep this page open while it plays.</li>
     </ol>
   </section>
@@ -159,7 +166,7 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   const B_LO = 28, B_HI = 55, NB = 4096, HB = 512;            // bass: E1..G3, finer FFT for low notes
   const JUMP_MEL = 0.35, JUMP_BASS = 0.5;                     // Viterbi cost per semitone of jump
   let frames = null, bassFr = null, beatTimes = [], env = null, track = "";
-  let origUrl = null, listen = "coil";
+  let origUrl = null, listen = "coil", realSong = null;
   const urls = {}, blobs = {};
 
   const setStatus = (t, err) => { $("status").textContent = t; $("status").className = "status" + (err ? " err" : ""); };
@@ -187,11 +194,28 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       return out.getChannelData(0);
     };
     try {
-      return { x: await band(110, 5000), xb: await band(0, 400), duration: buf.duration, rate: SR_A };
+      return { x: await band(110, 5000), xb: await band(0, 400), xr: await realBand(buf), duration: buf.duration, rate: SR_A };
     } catch (e) {                                   // no low-rate rendering: one plain signal for both
       const m = manualPrep(buf);
-      return { x: m.x, xb: m.x, duration: buf.duration, rate: m.rateFix };
+      return { x: m.x, xb: m.x, xr: null, duration: buf.duration, rate: m.rateFix };
     }
+  }
+  // Real-song mode input: 150 Hz-3.6 kHz (below half the carrier) and compressed so quiet parts
+  // still move the pulse width, rendered at the output rate
+  async function realBand(buf) {
+    const ctx = new OfflineAudioContext(1, Math.ceil(buf.duration * SR_OUT), SR_OUT);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 150;
+    const lp1 = ctx.createBiquadFilter(); lp1.type = "lowpass"; lp1.frequency.value = 3600;
+    const lp2 = ctx.createBiquadFilter(); lp2.type = "lowpass"; lp2.frequency.value = 3600;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -30; comp.knee.value = 10; comp.ratio.value = 6; comp.attack.value = 0.005; comp.release.value = 0.1;
+    src.connect(hp); hp.connect(lp1); lp1.connect(lp2); lp2.connect(comp); comp.connect(ctx.destination); src.start();
+    const out = await new Promise((res, rej) => {
+      ctx.oncomplete = e => res(e.renderedBuffer);
+      const p = ctx.startRendering(); if (p && p.then) p.then(res, rej);
+    });
+    return out.getChannelData(0);
   }
   function manualPrep(buf) {                    // fallback: average channels + box decimation
     const f = Math.max(1, Math.round(buf.sampleRate / SR_A));
@@ -398,8 +422,8 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   // Pulse mixing: each voice is a train of short pulses, one per cycle of its pitch, and the
   // trains are OR-ed so the coil fires at both pitches. Pulse width follows the song's loudness.
   // Caps: melody 35% + bass 15% = 50% on-time on average, measured equal to Classic over 100 ms; a beat hit briefly
-  // replaces the voices with its own 40% burst. The signal swings full scale (-FS..+FS) so the coil
-  // gets the strongest drive the audio format allows and plays well at lower coil settings.
+  // replaces the voices with its own 40% burst. The signal swings -A..+A so the coil
+  // gets a strong drive signal (80%, like Classic, which leaves headroom for Bluetooth compression).
   const DUTY = { mel: [0.25, 0.35], bass: [0.10, 0.15], beat: 0.4, beatHz: 150, beatLen: 0.03 };
   function renderCoil(mel, bass, beats, duration) {
     const len = Math.ceil((duration + 0.5) * SR_OUT), on = new Uint8Array(len), act = new Uint8Array(len);
@@ -421,8 +445,39 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       for (let s = s0; s < s1; s++) { act[s] = 1; on[s] = ((DUTY.beatHz * (s - s0) / SR_OUT) % 1) < DUTY.beat ? 1 : 0; }
     }
     const y = new Int16Array(len);
-    for (let s = 0; s < len; s++) y[s] = act[s] ? (on[s] ? 32767 : -32767) : 0;
+    const A = Math.round(AMP * 32767);              // same 80% level as Classic: full scale can clip over Bluetooth
+    for (let s = 0; s < len; s++) y[s] = act[s] ? (on[s] ? A : -A) : 0;
     window.coilDebugOn = on;                        // used by automated tests (on-time check)
+    return toWav(y);
+  }
+
+  // Real song: the coil only switches the spark on or off, so a plain song turns into fuzz. Adding a
+  // fast triangle carrier makes that on/off switch act like a class-D amplifier: the pulse width follows
+  // the music and the spark plays the actual recording (lo-fi). Quiet parts are muted so it doesn't hiss.
+  // On-time averages 50% while playing, like Classic.
+  function renderReal(xr, fc, duration) {
+    const len = Math.ceil((duration + 0.5) * SR_OUT), y = new Int16Array(len), n = Math.min(xr.length, len);
+    let pk = 1e-9; for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(xr[i]));
+    const B = 2048, nb = Math.max(1, Math.ceil(n / B)), rms = new Float32Array(nb);
+    for (let b = 0; b < nb; b++) {
+      let sq = 0, c = 0;
+      for (let i = b * B; i < Math.min(n, (b + 1) * B); i++, c++) sq += xr[i] * xr[i];
+      rms[b] = Math.sqrt(sq / Math.max(1, c));
+    }
+    const ref = Float32Array.from(rms).sort()[Math.floor(nb * 0.95)] || 1;
+    const k = 0.7 / pk, A = AMP * 32767 / 1.7;
+    let g = 0;
+    for (let i = 0; i < n; i++) {
+      g += ((rms[(i / B) | 0] > 0.04 * ref ? 1 : 0) - g) * 0.002;   // ~10 ms fade in/out of the mute
+      const ph = (i * fc / SR_OUT) % 1;
+      y[i] = Math.round(A * g * (k * xr[i] + 4 * Math.abs(ph - 0.5) - 1));
+    }
+    return toWav(y);
+  }
+  function renderPlain(xr, duration) {             // the band-limited song itself, for the Soft preview
+    const len = Math.ceil((duration + 0.5) * SR_OUT), y = new Int16Array(len), n = Math.min(xr.length, len);
+    let pk = 1e-9; for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(xr[i]));
+    for (let i = 0; i < n; i++) y[i] = Math.round(xr[i] / pk * AMP * 32767);
     return toWav(y);
   }
 
@@ -466,19 +521,35 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   const LISTEN = { orig: "Original song, for comparing on a speaker.",
                    soft: "Soft preview of the coil notes, for your ears only. The real coil sounds different.",
                    coil: "Coil version: this is what to play through the coil." };
+  const LISTEN_REAL = { soft: "The song as the coil will try to play it (bass and treble trimmed), for your ears.",
+                        coil: "Coil version: the real song on a carrier. On a normal speaker you'll hear a high whine; that's expected." };
   function setListen(which, keep = true) {
     listen = which;
     for (const [id, k] of [["abOrig", "orig"], ["abSoft", "soft"], ["abCoil", "coil"]]) $(id).classList.toggle("on", k === which);
     const p = $("player"), t = p.currentTime || 0, playing = !p.paused;
     p.src = which === "orig" ? origUrl : urls[which];
     if (keep) p.addEventListener("loadedmetadata", () => { p.currentTime = Math.min(t, p.duration || t); if (playing) p.play(); }, { once: true });
-    $("listenNote").textContent = LISTEN[which];
+    $("listenNote").textContent = $("mode").value === "real" && which !== "orig" ? LISTEN_REAL[which] : LISTEN[which];
   }
 
   let lastDuration = 0;
   function build() {
     const sens = +$("sens").value, shift = +$("oct").value, mode = $("mode").value, classic = mode === "classic";
     $("sensVal").textContent = sens < 0.85 ? "catch more" : sens > 1.15 ? "cleaner" : "normal";
+    $("carrierRow").classList.toggle("hidden", mode !== "real");
+    if (mode === "real") {
+      if (!realSong) { setStatus("Real song mode isn't available on this device. Pick another arrangement.", true); return; }
+      const fc = +$("carrier").value;
+      blobs.coil = renderReal(realSong, fc, lastDuration);
+      blobs.soft = renderPlain(realSong, lastDuration);
+      for (const k of ["coil", "soft"]) { if (urls[k]) URL.revokeObjectURL(urls[k]); urls[k] = URL.createObjectURL(blobs[k]); }
+      window.coilDebug = { notes: [], bass: [], beats: [], frames, mode, fc };   // used by automated tests
+      setListen(listen);
+      const mins = Math.floor(lastDuration / 60), secs = Math.round(lastDuration % 60);
+      $("stats").textContent = `Real song · ${fc / 1000} kHz carrier · ${mins}:${String(secs).padStart(2, "0")}`;
+      drawRoll([], [], lastDuration);
+      return;
+    }
     const notes = toNotes(frames, sens, shift, classic ? frames.midi : frames.track, 0.07);
     const bass = (mode === "bass" || mode === "full") ? dropDoubling(toNotes(bassFr, sens, shift, bassFr.track, 0.12), notes) : [];
     const beats = mode === "full" ? beatTimes : [];
@@ -505,8 +576,9 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       const ab = await file.arrayBuffer();
       setBar(0.08); setStatus("Decoding...");
       await tick();
-      const { x, xb, duration, rate } = await decodeAll(ab);
+      const { x, xb, xr, duration, rate } = await decodeAll(ab);
       lastDuration = duration;
+      realSong = xr;
       setStatus("Finding the melody...");
       frames = await analyse(x, rate);
       setStatus("Finding the bass and beat...");
@@ -520,7 +592,7 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       await tick();
       build();
       setBar(1);
-      if (window.coilDebug.notes.length) setStatus("Ready. Connect the coil by Bluetooth and press play.");
+      if (window.coilDebug.notes.length || window.coilDebug.mode === "real") setStatus("Ready. Connect the coil by Bluetooth and press play.");
       $("result").classList.remove("hidden");
     } catch (err) {
       setBar(0);
@@ -533,6 +605,7 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   $("sens").addEventListener("input", () => { const s = +$("sens").value; $("sensVal").textContent = s < 0.85 ? "catch more" : s > 1.15 ? "cleaner" : "normal"; });
   $("oct").addEventListener("change", () => frames && build());
   $("mode").addEventListener("change", () => frames && build());
+  $("carrier").addEventListener("change", () => frames && build());
   $("abOrig").addEventListener("click", () => origUrl && setListen("orig"));
   $("abSoft").addEventListener("click", () => urls.soft && setListen("soft"));
   $("abCoil").addEventListener("click", () => urls.coil && setListen("coil"));
