@@ -42,7 +42,7 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   .step { font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
   .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%;
          min-height: 48px; padding: 12px 16px; border-radius: 12px; border: 0; cursor: pointer;
-         background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 600; }
+         background: var(--accent); color: var(--accent-ink); font: inherit; font-weight: 600; text-decoration: none; }
   .btn.secondary { background: transparent; color: var(--accent); border: 1.5px solid var(--accent); }
   .btn:disabled { opacity: .45; cursor: default; }
   input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -62,6 +62,10 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   ol { margin: 0; padding-left: 20px; } li { margin: 4px 0; }
   .note { font-size: .85rem; color: var(--muted); margin-top: 16px; }
   .hidden { display: none; }
+  .gap { height: 10px; }
+  details { margin-top: 10px; font-size: .9rem; }
+  summary { cursor: pointer; color: var(--accent); font-weight: 600; min-height: 32px; }
+  details ol { margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -71,9 +75,23 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
 
   <section class="card">
     <p class="step">1 · Choose a song</p>
+    <a class="btn secondary" id="itunes" href="#">Get my iTunes song</a>
+    <div class="gap"></div>
     <label class="btn" for="file">Choose song file</label>
     <input id="file" type="file" accept="audio/*,.mp3,.m4a,.aac,.wav">
-    <div class="file-name" id="fileName">MP3, M4A or WAV from the Files app. Songs inside Apple Music or Pandora can't be opened.</div>
+    <div class="file-name" id="fileName">Bought it in iTunes? Tap "Get my iTunes song" first. It copies the song to Files, then comes back here so you can choose it.</div>
+    <details>
+      <summary>First time? Set up "Song to Files" (2 min)</summary>
+      <ol>
+        <li>In the Music app, tap the download arrow on your song.</li>
+        <li>Open the Shortcuts app and tap +.</li>
+        <li>Add action "Select Music".</li>
+        <li>Add action "Encode Media", tap its arrow and turn Audio Only on.</li>
+        <li>Add action "Save File".</li>
+        <li>Name the shortcut exactly <b>Song to Files</b> and tap Done.</li>
+      </ol>
+      <p>Songs streamed from Apple Music or Pandora can't be copied.</p>
+    </details>
     <div class="bar"><div id="bar"></div></div>
     <div class="status" id="status"></div>
   </section>
@@ -306,6 +324,9 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   $("sens").addEventListener("input", () => { const s = +$("sens").value; $("sensVal").textContent = s < 0.85 ? "catch more" : s > 1.15 ? "cleaner" : "normal"; });
   $("oct").addEventListener("change", () => frames && build());
   $("again").addEventListener("click", () => $("file").click());
+  const back = encodeURIComponent(location.href.split(/[?#]/)[0]);
+  $("itunes").href = "shortcuts://x-callback-url/run-shortcut?name=" + encodeURIComponent("Song to Files") +
+                     "&x-success=" + back + "&x-cancel=" + back + "&x-error=" + back;
   $("save").addEventListener("click", async () => {
     if (!wavBlob) return;
     const name = `${track} (coil).wav`, f = new File([wavBlob], name, { type: "audio/wav" });
