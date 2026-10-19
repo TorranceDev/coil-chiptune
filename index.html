@@ -86,9 +86,10 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     <p class="step">1 · Choose a song</p>
     <a class="btn secondary" id="itunes" href="#">Get my iTunes song</a>
     <div class="gap"></div>
-    <label class="btn" for="file">Choose song file</label>
-    <input id="file" type="file" accept="audio/*,.mp3,.m4a,.aac,.wav">
-    <div class="file-name" id="fileName">Bought it in iTunes? Tap "Get my iTunes song" first. It copies the song to Files, then comes back here so you can choose it.</div>
+    <label class="btn" for="file">Choose song or MIDI file</label>
+    <input id="file" type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.mid,.midi,audio/midi">
+    <div class="file-name" id="fileName">Bought it in iTunes? Tap "Get my iTunes song" first. It copies the song to Files, then comes back here so you can choose it.
+      For orchestral songs, a MIDI file of the melody plays exactly right on the coil.</div>
     <details>
       <summary>First time? Set up "Song to Files" (2 min)</summary>
       <ol>
@@ -108,7 +109,7 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   <section class="card hidden" id="result">
     <p class="step">2 · Play it on the coil</p>
     <p class="stats" id="stats"></p>
-    <canvas id="roll" aria-label="Melody and bass preview"></canvas>
+    <canvas id="roll" aria-label="Melody preview"></canvas>
     <div class="seg" role="group" aria-label="What to listen to">
       <button id="abOrig" type="button">Original</button>
       <button id="abSoft" type="button">Soft preview</button>
@@ -120,22 +121,16 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       <button class="btn secondary" id="save">Save coil version</button>
       <button class="btn secondary" id="again">Another song</button>
     </div>
-    <label class="ctl">Coil arrangement
+    <label class="ctl" id="modeRow">Coil arrangement
       <select id="mode">
         <option value="classic" selected>Classic</option>
-        <option value="real">Real song (experimental)</option>
-        <option value="full">Melody + bass + beat</option>
-        <option value="bass">Melody + bass</option>
-        <option value="melody">Melody only</option>
+        <option value="smooth">Smooth melody</option>
       </select>
     </label>
-    <label class="ctl hidden" id="carrierRow">Carrier
-      <select id="carrier">
-        <option value="8000" selected>8 kHz (clearest in tests)</option>
-        <option value="11000">11 kHz (less whine)</option>
-      </select>
+    <label class="ctl hidden" id="trackRow">Melody track
+      <select id="trackSel"></select>
     </label>
-    <label class="ctl">Melody pickiness <span id="sensVal">normal</span>
+    <label class="ctl" id="sensRow">Melody pickiness <span id="sensVal">normal</span>
       <input id="sens" type="range" min="0.5" max="2" step="0.1" value="1">
     </label>
     <label class="ctl">Pitch
@@ -180,17 +175,16 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   const SR_A = 11025, N = 2048, HOP = 256, SR_OUT = 44100, AMP = 0.8;
   const M_LO = 43, M_HI = 96, HARM = 8, TOP_BIAS = 0.025;   // up to C7 for violins/flute/celesta; favour the top line
   const $ = id => document.getElementById(id);
-  const B_LO = 28, B_HI = 55, NB = 4096, HB = 512;            // bass: E1..G3, finer FFT for low notes
-  const JUMP_MEL = 0.35, JUMP_BASS = 0.5;                     // Viterbi cost per semitone of jump
-  let frames = null, bassFr = null, beatTimes = [], env = null, track = "";
-  let origUrl = null, listen = "coil", realSong = null;
+  const JUMP_MEL = 0.35;                                       // Viterbi cost per semitone of jump
+  let frames = null, env = null, track = "", midiSong = null;
+  let origUrl = null, listen = "coil";
   const urls = {}, blobs = {};
 
   const setStatus = (t, err) => { $("status").textContent = t; $("status").className = "status" + (err ? " err" : ""); };
   const setBar = f => { $("bar").style.width = Math.round(f * 100) + "%"; };
   const tick = () => new Promise(r => setTimeout(r, 0));
 
-  // ---------- decode once; render a melody band (110 Hz-5 kHz) and a bass band (<400 Hz)
+  // ---------- decode once; render the melody band (110 Hz-5 kHz) at the analysis rate
   async function decodeAll(arrayBuf) {
     const probe = new OfflineAudioContext(1, 1, 44100);
     const buf = await new Promise((res, rej) => {
@@ -211,28 +205,11 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
       return out.getChannelData(0);
     };
     try {
-      return { x: await band(110, 5000), xb: await band(0, 400), xr: await realBand(buf), duration: buf.duration, rate: SR_A };
-    } catch (e) {                                   // no low-rate rendering: one plain signal for both
+      return { x: await band(110, 5000), duration: buf.duration, rate: SR_A };
+    } catch (e) {                                   // no low-rate rendering: plain decimated signal
       const m = manualPrep(buf);
-      return { x: m.x, xb: m.x, xr: null, duration: buf.duration, rate: m.rateFix };
+      return { x: m.x, duration: buf.duration, rate: m.rateFix };
     }
-  }
-  // Real-song mode input: 150 Hz-3.6 kHz (below half the carrier) and compressed so quiet parts
-  // still move the pulse width, rendered at the output rate
-  async function realBand(buf) {
-    const ctx = new OfflineAudioContext(1, Math.ceil(buf.duration * SR_OUT), SR_OUT);
-    const src = ctx.createBufferSource(); src.buffer = buf;
-    const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 150;
-    const lp1 = ctx.createBiquadFilter(); lp1.type = "lowpass"; lp1.frequency.value = 3600;
-    const lp2 = ctx.createBiquadFilter(); lp2.type = "lowpass"; lp2.frequency.value = 3600;
-    const comp = ctx.createDynamicsCompressor();
-    comp.threshold.value = -30; comp.knee.value = 10; comp.ratio.value = 6; comp.attack.value = 0.005; comp.release.value = 0.1;
-    src.connect(hp); hp.connect(lp1); lp1.connect(lp2); lp2.connect(comp); comp.connect(ctx.destination); src.start();
-    const out = await new Promise((res, rej) => {
-      ctx.oncomplete = e => res(e.renderedBuffer);
-      const p = ctx.startRendering(); if (p && p.then) p.then(res, rej);
-    });
-    return out.getChannelData(0);
   }
   function manualPrep(buf) {                    // fallback: average channels + box decimation
     const f = Math.max(1, Math.round(buf.sampleRate / SR_A));
@@ -298,37 +275,6 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     return out;
   }
 
-  // ---------- bass analysis: same harmonic sum, low range, longer window
-  async function analyseBass(x, rate) {
-    const win = new Float32Array(NB); for (let i = 0; i < NB; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / NB);
-    const binHz = rate / NB, nF = Math.max(0, Math.floor((x.length - NB) / HB) + 1);
-    const cand = []; for (let m = B_LO; m <= B_HI; m++) cand.push(440 * Math.pow(2, (m - 69) / 12));
-    const C = cand.length;
-    const out = { midi: new Int8Array(nF), sal: new Float32Array(nF), rms: new Float32Array(nF), all: new Float32Array(nF * C),
-                  nc: C, mLo: B_LO, hop: HB / rate, lag: NB / 2 / rate };
-    const re = new Float64Array(NB), im = new Float64Array(NB), mag = new Float32Array(NB / 2);
-    for (let f = 0; f < nF; f++) {
-      const o = f * HB; let e = 0;
-      for (let i = 0; i < NB; i++) { const v = x[o + i]; e += v * v; re[i] = v * win[i]; im[i] = 0; }
-      out.rms[f] = Math.sqrt(e / NB);
-      fft(re, im);
-      for (let k = 0; k < NB / 2; k++) mag[k] = Math.sqrt(Math.hypot(re[k], im[k]));
-      let best = 0, bestM = 0;
-      for (let c = 0; c < C; c++) {
-        let s = 0, w = 1;
-        for (let h = 1; h <= 5; h++, w *= 0.7) {
-          const k = Math.round(h * cand[c] / binHz); if (k + 1 >= NB / 2) break;
-          s += w * Math.max(mag[k - 1], mag[k], mag[k + 1]);
-        }
-        out.all[f * C + c] = s;
-        if (s > best) { best = s; bestM = B_LO + c; }
-      }
-      out.midi[f] = bestM; out.sal[f] = best;
-      if ((f & 127) === 0) { setBar(0.75 + 0.15 * f / nF); await tick(); }
-    }
-    return out;
-  }
-
   // ---------- Viterbi: the best-scoring pitch path through the whole song. Each frame scores
   // log(salience); a jump of j semitones costs JUMP*j, so the line follows one instrument
   // instead of hopping to whatever is loudest in a single 23 ms slice.
@@ -352,19 +298,6 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     return path;
   }
 
-  // ---------- beats: peaks in spectral flux well above their local average
-  function onsets(fr) {
-    const n = fr.flux.length, w = Math.max(1, Math.round(0.25 / fr.hop)), gap = Math.round(0.1 / fr.hop), out = [];
-    const floor = Float32Array.from(fr.flux).sort()[n >> 1] || 0;
-    let last = -1e9;
-    for (let i = 1; i < n - 1; i++) {
-      if (fr.flux[i] < fr.flux[i - 1] || fr.flux[i] < fr.flux[i + 1]) continue;
-      let s = 0, c = 0; for (let k = Math.max(0, i - w); k < Math.min(n, i + w); k++) { s += fr.flux[k]; c++; }
-      if (fr.flux[i] > 1.6 * s / c && fr.flux[i] > 1.3 * floor && i - last >= gap) { out.push(i * fr.hop + fr.lag); last = i; }
-    }
-    return out;
-  }
-
   // ---------- loudness envelope (0.25..1), smoothed over ~0.2 s, relative to the song's loud parts
   function loudness(fr) {
     const n = fr.rms.length, w = Math.max(1, Math.round(0.1 / fr.hop)), e = new Float32Array(n);
@@ -374,19 +307,6 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     return { e, hop: fr.hop, lag: fr.lag };
   }
   const loudAt = t => { const i = Math.round((t - env.lag) / env.hop); return env.e[Math.min(env.e.length - 1, Math.max(0, i))]; };
-
-  // a bass note on the melody's own pitch or one octave below is usually the melody leaking
-  // into the bass detector; two octaves down is a real bass line, so keep it
-  function dropDoubling(bass, mel) {
-    return bass.filter(b => {
-      let same = 0;
-      for (const q of mel) {
-        const o = Math.min(b.t1, q.t1) - Math.max(b.t0, q.t0), d = q.m - b.m;
-        if (o > 0 && (d === 0 || d === 12)) same += o;
-      }
-      return same < 0.6 * (b.t1 - b.t0);
-    });
-  }
 
   // ---------- turn frames into notes (voicing, smoothing, minimum length)
   function toNotes(fr, sens, shift, pitches, minLen) {
@@ -436,68 +356,6 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     return toWav(y);
   }
 
-  // Pulse mixing: each voice is a train of short pulses, one per cycle of its pitch, and the
-  // trains are OR-ed so the coil fires at both pitches. Pulse width follows the song's loudness.
-  // Caps: melody 35% + bass 15% = 50% on-time on average, measured equal to Classic over 100 ms; a beat hit briefly
-  // replaces the voices with its own 40% burst. The signal swings -A..+A so the coil
-  // gets a strong drive signal (80%, like Classic, which leaves headroom for Bluetooth compression).
-  const DUTY = { mel: [0.25, 0.35], bass: [0.10, 0.15], beat: 0.4, beatHz: 150, beatLen: 0.03 };
-  function renderCoil(mel, bass, beats, duration) {
-    const len = Math.ceil((duration + 0.5) * SR_OUT), on = new Uint8Array(len), act = new Uint8Array(len);
-    const voice = (notes, [d0, d1]) => {
-      for (let i = 0; i < notes.length; i++) {
-        const q = notes[i], s0 = Math.round(q.t0 * SR_OUT), s1 = Math.min(len, Math.round(restrikeEnd(notes, i) * SR_OUT));
-        const f = 440 * Math.pow(2, (q.m - 69) / 12);
-        let d = d0;
-        for (let s = s0; s < s1; s++) {
-          if ((s - s0) % 512 === 0) d = d0 + (d1 - d0) * (loudAt(s / SR_OUT) - 0.25) / 0.75;
-          act[s] = 1; if (((f * (s - s0) / SR_OUT) % 1) < d) on[s] = 1;
-        }
-      }
-    };
-    voice(mel, DUTY.mel);
-    voice(bass, DUTY.bass);
-    for (const t of beats) {
-      const s0 = Math.round(t * SR_OUT), s1 = Math.min(len, s0 + Math.round(DUTY.beatLen * SR_OUT));
-      for (let s = s0; s < s1; s++) { act[s] = 1; on[s] = ((DUTY.beatHz * (s - s0) / SR_OUT) % 1) < DUTY.beat ? 1 : 0; }
-    }
-    const y = new Int16Array(len);
-    const A = Math.round(AMP * 32767);              // same 80% level as Classic: full scale can clip over Bluetooth
-    for (let s = 0; s < len; s++) y[s] = act[s] ? (on[s] ? A : -A) : 0;
-    window.coilDebugOn = on;                        // used by automated tests (on-time check)
-    return toWav(y);
-  }
-
-  // Real song: the coil only switches the spark on or off, so a plain song turns into fuzz. Adding a
-  // fast triangle carrier makes that on/off switch act like a class-D amplifier: the pulse width follows
-  // the music and the spark plays the actual recording (lo-fi). Quiet parts are muted so it doesn't hiss.
-  // On-time averages 50% while playing, like Classic.
-  function renderReal(xr, fc, duration) {
-    const len = Math.ceil((duration + 0.5) * SR_OUT), y = new Int16Array(len), n = Math.min(xr.length, len);
-    let pk = 1e-9; for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(xr[i]));
-    const B = 2048, nb = Math.max(1, Math.ceil(n / B)), rms = new Float32Array(nb);
-    for (let b = 0; b < nb; b++) {
-      let sq = 0, c = 0;
-      for (let i = b * B; i < Math.min(n, (b + 1) * B); i++, c++) sq += xr[i] * xr[i];
-      rms[b] = Math.sqrt(sq / Math.max(1, c));
-    }
-    const ref = Float32Array.from(rms).sort()[Math.floor(nb * 0.95)] || 1;
-    const k = 0.7 / pk, A = AMP * 32767 / 1.7;
-    let g = 0;
-    for (let i = 0; i < n; i++) {
-      g += ((rms[(i / B) | 0] > 0.04 * ref ? 1 : 0) - g) * 0.002;   // ~10 ms fade in/out of the mute
-      const ph = (i * fc / SR_OUT) % 1;
-      y[i] = Math.round(A * g * (k * xr[i] + 4 * Math.abs(ph - 0.5) - 1));
-    }
-    return toWav(y);
-  }
-  function renderPlain(xr, duration) {             // the band-limited song itself, for the Soft preview
-    const len = Math.ceil((duration + 0.5) * SR_OUT), y = new Int16Array(len), n = Math.min(xr.length, len);
-    let pk = 1e-9; for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(xr[i]));
-    for (let i = 0; i < n; i++) y[i] = Math.round(xr[i] / pk * AMP * 32767);
-    return toWav(y);
-  }
-
   // Soft preview: same notes as a gentle tone with fade in/out, for ears only (not for the coil)
   function renderSoft(mel, bass, duration) {
     const len = Math.ceil((duration + 0.5) * SR_OUT), buf = new Float32Array(len);
@@ -538,47 +396,49 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
   const LISTEN = { orig: "Original song, for comparing on a speaker.",
                    soft: "Soft preview of the coil notes, for your ears only. The real coil sounds different.",
                    coil: "Coil version: this is what to play through the coil." };
-  const LISTEN_REAL = { soft: "The song as the coil will try to play it (bass and treble trimmed), for your ears.",
-                        coil: "Coil version: the real song on a carrier. On a normal speaker you'll hear a high whine; that's expected." };
+  const LISTEN_MIDI_ORIG = "The whole MIDI arrangement as a soft tone, for comparing on a speaker.";
   function setListen(which, keep = true) {
     listen = which;
     for (const [id, k] of [["abOrig", "orig"], ["abSoft", "soft"], ["abCoil", "coil"]]) $(id).classList.toggle("on", k === which);
     const p = $("player"), t = p.currentTime || 0, playing = !p.paused;
     p.src = which === "orig" ? origUrl : urls[which];
     if (keep) p.addEventListener("loadedmetadata", () => { p.currentTime = Math.min(t, p.duration || t); if (playing) p.play(); }, { once: true });
-    $("listenNote").textContent = $("mode").value === "real" && which !== "orig" ? LISTEN_REAL[which] : LISTEN[which];
+    $("listenNote").textContent = midiSong && which === "orig" ? LISTEN_MIDI_ORIG : LISTEN[which];
   }
 
   let lastDuration = 0;
-  function build() {
-    const sens = +$("sens").value, shift = +$("oct").value, mode = $("mode").value, classic = mode === "classic";
-    $("sensVal").textContent = sens < 0.85 ? "catch more" : sens > 1.15 ? "cleaner" : "normal";
-    $("carrierRow").classList.toggle("hidden", mode !== "real");
-    if (mode === "real") {
-      if (!realSong) { setStatus("Real song mode isn't available on this device. Pick another arrangement.", true); return; }
-      const fc = +$("carrier").value;
-      blobs.coil = renderReal(realSong, fc, lastDuration);
-      blobs.soft = renderPlain(realSong, lastDuration);
-      for (const k of ["coil", "soft"]) { if (urls[k]) URL.revokeObjectURL(urls[k]); urls[k] = URL.createObjectURL(blobs[k]); }
-      window.coilDebug = { notes: [], bass: [], beats: [], frames, mode, fc };   // used by automated tests
-      setListen(listen);
-      const mins = Math.floor(lastDuration / 60), secs = Math.round(lastDuration % 60);
-      $("stats").textContent = `Real song · ${fc / 1000} kHz carrier · ${mins}:${String(secs).padStart(2, "0")}`;
-      drawRoll([], [], lastDuration);
-      return;
-    }
-    const notes = toNotes(frames, sens, shift, classic ? frames.midi : frames.track, 0.07);
-    const bass = (mode === "bass" || mode === "full") ? dropDoubling(toNotes(bassFr, sens, shift, bassFr.track, 0.12), notes) : [];
-    const beats = mode === "full" ? beatTimes : [];
-    blobs.coil = classic ? renderClassic(notes, lastDuration) : renderCoil(notes, bass, beats, lastDuration);
-    blobs.soft = renderSoft(notes, bass, lastDuration);
+  function publish(notes, label) {
+    blobs.soft = renderSoft(notes, [], lastDuration);
     for (const k of ["coil", "soft"]) { if (urls[k]) URL.revokeObjectURL(urls[k]); urls[k] = URL.createObjectURL(blobs[k]); }
-    window.coilDebug = { notes, bass, beats, frames, mode };   // used by automated tests
     setListen(listen);
     const mins = Math.floor(lastDuration / 60), secs = Math.round(lastDuration % 60);
-    $("stats").textContent = `${notes.length} melody · ${bass.length} bass · ${beats.length} beats · ${mins}:${String(secs).padStart(2, "0")}`;
-    drawRoll(notes, bass, lastDuration);
+    $("stats").textContent = `${notes.length} notes · ${label} · ${mins}:${String(secs).padStart(2, "0")}`;
+    drawRoll(notes, [], lastDuration);
+  }
+  function build() {
+    const sens = +$("sens").value, shift = +$("oct").value, mode = $("mode").value;
+    $("sensVal").textContent = sens < 0.85 ? "catch more" : sens > 1.15 ? "cleaner" : "normal";
+    if (midiSong) {
+      const ti = +$("trackSel").value, src = ti < 0 ? midiSong.all : midiSong.tracks[ti].notes;
+      const notes = topLine(src).map(q => ({ t0: q.t0, t1: q.t1, m: Math.min(108, Math.max(24, q.m + shift)) }));
+      blobs.coil = renderClassic(notes, lastDuration);
+      window.coilDebug = { notes, mode: "midi" };     // used by automated tests
+      publish(notes, "from MIDI");
+      return;
+    }
+    // Classic: loudest pitch per slice. Smooth melody: Viterbi-tracked line. Both play as a 50% square,
+    // the only signal the coil sound test showed this coil can play.
+    const notes = toNotes(frames, sens, shift, mode === "smooth" ? frames.track : frames.midi, 0.07);
+    blobs.coil = renderClassic(notes, lastDuration);
+    window.coilDebug = { notes, frames, mode };      // used by automated tests
+    publish(notes, mode === "smooth" ? "smooth melody" : "classic");
     if (!notes.length) setStatus('No clear melody found. Try moving "Melody pickiness" toward "catch more".', true);
+  }
+
+  function showControls(isMidi) {
+    $("modeRow").classList.toggle("hidden", isMidi);
+    $("sensRow").classList.toggle("hidden", isMidi);
+    $("trackRow").classList.toggle("hidden", !isMidi);
   }
 
   $("file").addEventListener("change", async e => {
@@ -586,37 +446,138 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     track = file.name.replace(/\.[^.]+$/, "");
     $("fileName").textContent = file.name;
     $("result").classList.add("hidden");
-    setBar(0.03); setStatus("Reading song...");
+    setBar(0.03); setStatus("Reading file...");
     try {
       if (origUrl) URL.revokeObjectURL(origUrl);
-      origUrl = URL.createObjectURL(file);
+      origUrl = null;
       const ab = await file.arrayBuffer();
+      const head = String.fromCharCode(...new Uint8Array(ab, 0, Math.min(4, ab.byteLength)));
+      if (head === "MThd") {                           // MIDI: exact notes, no guessing
+        const tracks = parseMidi(ab), all = tracks.flatMap(t => t.notes).filter(q => q.ch !== 9);
+        if (!all.length) throw new Error("no notes in this MIDI file");
+        midiSong = { tracks, all };
+        frames = null;
+        lastDuration = Math.max(...all.map(q => q.t1));
+        env = { e: new Float32Array([1]), hop: 1, lag: 0 };   // MIDI has no loudness curve here
+        const pick = pickTrack(tracks);
+        $("trackSel").innerHTML = `<option value="-1">All tracks (top note)</option>` + tracks.map((t, i) =>
+          t.notes.length ? `<option value="${i}">${t.name.replace(/[<>&"]/g, "")} · ${t.notes.length} notes</option>` : "").join("");
+        $("trackSel").value = String(pick);
+        origUrl = URL.createObjectURL(renderSoft(all, [], lastDuration));
+        showControls(true);
+        $("result").classList.remove("hidden");
+        await tick();
+        build();
+        setBar(1);
+        setStatus(pick < 0 ? "Ready. Playing the top note of all tracks; pick the melody track below if it sounds wrong."
+                           : "Ready. Melody track picked automatically; change it below if it sounds wrong.");
+        e.target.value = "";
+        return;
+      }
+      midiSong = null;
+      origUrl = URL.createObjectURL(file);
       setBar(0.08); setStatus("Decoding...");
       await tick();
-      const { x, xb, xr, duration, rate } = await decodeAll(ab);
+      const { x, duration, rate } = await decodeAll(ab);
       lastDuration = duration;
-      realSong = xr;
       setStatus("Finding the melody...");
       frames = await analyse(x, rate);
-      setStatus("Finding the bass and beat...");
-      bassFr = await analyseBass(xb, rate);
       frames.track = viterbi(frames, JUMP_MEL);
-      bassFr.track = viterbi(bassFr, JUMP_BASS);
-      beatTimes = onsets(frames);
       env = loudness(frames);
       setStatus("Building chiptune...");
+      showControls(false);
       $("result").classList.remove("hidden");   // visible first so the preview has a size
       await tick();
       build();
       setBar(1);
-      if (window.coilDebug.notes.length || window.coilDebug.mode === "real") setStatus("Ready. Connect the coil by Bluetooth and press play.");
-      $("result").classList.remove("hidden");
+      if (window.coilDebug.notes.length) setStatus("Ready. Connect the coil by Bluetooth and press play.");
     } catch (err) {
       setBar(0);
-      setStatus("Couldn't open that file. It may be copy-protected or not a supported audio format (" + (err && err.message || err) + ").", true);
+      setStatus("Couldn't open that file. It may be copy-protected or not a supported audio or MIDI file (" + (err && err.message || err) + ").", true);
     }
     e.target.value = "";
   });
+
+  // ---------- MIDI: Standard MIDI File (format 0/1) -> notes in seconds, per track
+  function parseMidi(buf) {
+    const d = new Uint8Array(buf);
+    const u32 = i => ((d[i] << 24) | (d[i + 1] << 16) | (d[i + 2] << 8) | d[i + 3]) >>> 0, u16 = i => (d[i] << 8) | d[i + 1];
+    const fmt = u16(8), ntr = u16(10), div = u16(12);
+    if (fmt > 1) throw new Error("MIDI format 2 isn't supported");
+    if (div & 0x8000) throw new Error("SMPTE-timed MIDI isn't supported");
+    let pos = 8 + u32(4); const raw = [];
+    while (pos + 8 <= d.length && raw.length < ntr) {
+      const id = String.fromCharCode(d[pos], d[pos + 1], d[pos + 2], d[pos + 3]), end = pos + 8 + u32(pos + 4);
+      if (end > d.length) throw new Error("MIDI file is cut short (incomplete download?)");
+      if (id === "MTrk") raw.push(readTrack(d, pos + 8, end));
+      pos = end;
+    }
+    const tempos = raw.flatMap(t => t.ev.filter(e => e.tempo)).sort((a, b) => a.tick - b.tick);
+    const pts = [[0, 0, 500000]];                      // [tick, seconds, microseconds per beat]
+    for (const e of tempos) { const [lt, ls, lus] = pts[pts.length - 1]; pts.push([e.tick, ls + (e.tick - lt) * lus / 1e6 / div, e.tempo]); }
+    const sec = tk => { let q = pts[0]; for (const r of pts) if (r[0] <= tk) q = r; return q[1] + (tk - q[0]) * q[2] / 1e6 / div; };
+    return raw.map((t, i) => {
+      const open = new Map(), notes = [];
+      for (const e of t.ev) {
+        if (e.n === undefined) continue;
+        const k = e.ch * 128 + e.n;
+        if (e.on) { if (!open.has(k)) open.set(k, []); open.get(k).push(e.tick); }
+        else { const st = open.get(k); if (st && st.length) notes.push({ t0: sec(st.shift()), t1: sec(e.tick), m: e.n, ch: e.ch }); }
+      }
+      const last = t.end;                            // notes never switched off last to the track's end
+      for (const [k, st] of open) for (const tk of st) notes.push({ t0: sec(tk), t1: sec(last), m: k % 128, ch: (k / 128) | 0 });
+      return { name: t.name || `Track ${i + 1}`, notes: notes.filter(q => q.t1 > q.t0).sort((a, b) => a.t0 - b.t0) };
+    });
+  }
+  function readTrack(d, i, end) {
+    const ev = []; let tick = 0, run = 0, name = "";
+    const vlq = () => { let v = 0, b; do { if (i >= end) throw new Error("MIDI track is cut short"); b = d[i++]; v = (v << 7) | (b & 0x7f); } while (b & 0x80); return v; };
+    while (i < end) {
+      tick += vlq(); if (i >= end) break;
+      const st = d[i];
+      if (st === 0xff) {
+        const type = d[i + 1]; i += 2; const len = vlq();
+        if (type === 0x51 && len === 3) ev.push({ tick, tempo: (d[i] << 16) | (d[i + 1] << 8) | d[i + 2] });
+        if (type === 0x03 && !name) name = String.fromCharCode(...d.subarray(i, i + len)).trim();
+        i += len; if (type === 0x2f) break; continue;
+      }
+      if (st === 0xf0 || st === 0xf7) { i++; i += vlq(); continue; }
+      if (st & 0x80) { run = st; i++; } else if (!run) throw new Error("bad MIDI data");
+      const kind = run & 0xf0, ch = run & 0x0f, a = d[i], b = d[i + 1], size = (kind === 0xc0 || kind === 0xd0) ? 1 : 2;
+      if (i + size > end) throw new Error("MIDI track is cut short");
+      i += size;
+      if (kind === 0x90 && b > 0) ev.push({ tick, on: true, n: a, ch });
+      else if (kind === 0x80 || kind === 0x90) ev.push({ tick, on: false, n: a, ch });
+    }
+    return { ev, name, end: tick };
+  }
+  // one line from possibly overlapping notes: the highest sounding note at each moment (drums skipped)
+  function topLine(notes) {
+    const ns = notes.filter(q => q.ch !== 9);
+    const bounds = [...new Set(ns.flatMap(q => [q.t0, q.t1]))].sort((a, b) => a - b), out = [];
+    let act = [], j = 0;
+    const byStart = ns.slice().sort((a, b) => a.t0 - b.t0);
+    for (let k = 0; k + 1 < bounds.length; k++) {
+      const a = bounds[k], b = bounds[k + 1], mid = (a + b) / 2;
+      while (j < byStart.length && byStart[j].t0 <= mid) act.push(byStart[j++]);
+      act = act.filter(q => q.t1 > mid);
+      if (!act.length) continue;
+      let top = act[0]; for (const q of act) if (q.m > top.m || (q.m === top.m && q.t0 > top.t0)) top = q;
+      const last = out[out.length - 1];
+      if (last && last.src === top && Math.abs(last.t1 - a) < 1e-9) last.t1 = b; else out.push({ t0: a, t1: b, m: top.m, src: top });
+    }
+    return out;
+  }
+  // likely melody track: plenty of notes, mostly above middle C; -1 = use all tracks
+  function pickTrack(tracks) {
+    let best = -1, bestScore = 0;
+    tracks.forEach((t, i) => {
+      const ns = t.notes.filter(q => q.ch !== 9); if (ns.length < 8) return;
+      const mean = ns.reduce((s, q) => s + q.m, 0) / ns.length, score = ns.length * (mean >= 60 ? 2 : 1);
+      if (score > bestScore) { bestScore = score; best = i; }
+    });
+    return tracks.filter(t => t.notes.length).length > 1 ? best : -1;
+  }
 
   // ---------- coil sound test: one public-domain phrase, four encodings
   const ODE = [[64, 1], [64, 1], [65, 1], [67, 1], [67, 1], [65, 1], [64, 1], [62, 1],
@@ -662,11 +623,11 @@ Bluetooth music Tesla coil. Everything runs on the phone; nothing is uploaded.
     const tp = $("testPlayer"); tp.src = testUrl; tp.play().catch(() => {});
   }));
 
-  $("sens").addEventListener("change", () => frames && build());
+  $("sens").addEventListener("change", () => (frames || midiSong) && build());
   $("sens").addEventListener("input", () => { const s = +$("sens").value; $("sensVal").textContent = s < 0.85 ? "catch more" : s > 1.15 ? "cleaner" : "normal"; });
-  $("oct").addEventListener("change", () => frames && build());
+  $("oct").addEventListener("change", () => (frames || midiSong) && build());
   $("mode").addEventListener("change", () => frames && build());
-  $("carrier").addEventListener("change", () => frames && build());
+  $("trackSel").addEventListener("change", () => midiSong && build());
   $("abOrig").addEventListener("click", () => origUrl && setListen("orig"));
   $("abSoft").addEventListener("click", () => urls.soft && setListen("soft"));
   $("abCoil").addEventListener("click", () => urls.coil && setListen("coil"));
